@@ -202,23 +202,42 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
-                # Enhanced prompt with failure context
+                # Enhanced prompt with task decomposition and strict completion rules
                 system_prompt = (
-                    "You are a human web user. Look at the screenshot. "
-                    "Goal: " + request.prompt + ". "
-                    "Return JSON ONLY. "
+                    "You are a human web user automating a task. Look at the screenshot carefully.\n\n"
+                    f"FULL GOAL: {request.prompt}\n\n"
+                    "CRITICAL RULES:\n"
+                    "1. Break the goal into ALL required steps. Complete EVERY step before returning 'done'.\n"
+                    "2. For example, if goal is 'search X, add to cart, checkout':\n"
+                    "   - Step A: Search for X on the website\n"
+                    "   - Step B: Click on the correct product\n"
+                    "   - Step C: Click 'Add to Cart' button\n"
+                    "   - Step D: Click 'Proceed to Checkout' or 'Go to Cart'\n"
+                    "   - ONLY THEN return action='done'\n"
+                    "3. Never assume a step is complete unless you can SEE confirmation on screen.\n"
+                    "4. If you see 'Added to Cart' message or cart icon updated, that's ONE step done, but continue to next step.\n"
+                    "5. Only return action='done' when you have FULLY COMPLETED the ENTIRE goal with ALL steps visible.\n\n"
+                    f"Current Step: {step}/50\n"
                 )
                 
                 # If stuck in a loop, give additional guidance
                 if consecutive_failures > 3:
                     system_prompt += (
-                        f"WARNING: You've had {consecutive_failures} consecutive failures. "
+                        f"\nWARNING: You've had {consecutive_failures} consecutive failures. "
                         "If you're stuck on a popup/login that cannot be closed, return action='done' with reason='Cannot proceed - blocking element'. "
-                        "If same action keeps failing, try a DIFFERENT approach. "
+                        "If same action keeps failing, try a DIFFERENT approach or element. "
+                    )
+                
+                # If finishing too early, warn about it
+                if step < 5:
+                    system_prompt += (
+                        f"\nNOTE: You are only at step {step}. Most tasks require 5-15 steps. "
+                        "Make sure you've completed ALL parts of the goal before marking 'done'. "
                     )
                 
                 system_prompt += (
-                    "Format: {\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text\", \"text_to_type\": \"...\", \"reason\": \"...\"}"
+                    "\n\nReturn JSON ONLY in this exact format:\n"
+                    "{\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text_on_button_or_link\", \"text_to_type\": \"...\", \"reason\": \"what_you_are_doing_and_why\"}"
                 )
 
                 # Ask GPT-4o
@@ -260,6 +279,32 @@ async def run_agent(request: AgentRequest):
                     break
 
                 if decision['action'] == 'done':
+                    # Additional validation: prevent premature completion
+                    if step < 4:
+                        print(f"⚠️ Agent tried to finish at step {step} (too early). Asking for verification...")
+                        # Ask AI to confirm if task is REALLY complete
+                        verify_response = await client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": f"Look at this screenshot. The task was: '{request.prompt}'. Is this task COMPLETELY finished with ALL steps done? Answer only 'YES' or 'NO' with 1 sentence explanation."
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{last_b64_image}"}}]
+                                }
+                            ],
+                            max_tokens=100
+                        )
+                        verification = verify_response.choices[0].message.content
+                        print(f"🔍 Verification: {verification}")
+                        
+                        if "NO" in verification.upper():
+                            print(f"❌ Verification failed. Continuing task...")
+                            consecutive_failures += 1
+                            continue
+                    
                     final_message = f"Success: {reason}"
                     final_status = "success"
                     break
