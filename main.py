@@ -129,6 +129,11 @@ async def run_agent(request: AgentRequest):
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     
     last_b64_image = None 
+    
+    # Track repeated failures to avoid endless loops
+    consecutive_failures = 0
+    last_action = None
+    action_repeat_count = 0
 
     try:
         async with async_playwright() as p:
@@ -197,19 +202,32 @@ async def run_agent(request: AgentRequest):
                 with open(img_path, "wb") as f:
                     f.write(base64.b64decode(last_b64_image))
 
+                # Enhanced prompt with failure context
+                system_prompt = (
+                    "You are a human web user. Look at the screenshot. "
+                    "Goal: " + request.prompt + ". "
+                    "Return JSON ONLY. "
+                )
+                
+                # If stuck in a loop, give additional guidance
+                if consecutive_failures > 3:
+                    system_prompt += (
+                        f"WARNING: You've had {consecutive_failures} consecutive failures. "
+                        "If you're stuck on a popup/login that cannot be closed, return action='done' with reason='Cannot proceed - blocking element'. "
+                        "If same action keeps failing, try a DIFFERENT approach. "
+                    )
+                
+                system_prompt += (
+                    "Format: {\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text\", \"text_to_type\": \"...\", \"reason\": \"...\"}"
+                )
+
                 # Ask GPT-4o
                 response = await client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
                         {
                             "role": "system",
-                            "content": (
-                                "You are a human web user. Look at the screenshot. "
-                                "Goal: " + request.prompt + ". "
-                                "Return JSON ONLY. "
-                                "If a Login Popup appears, your goal changes to 'Close popup' or 'Login'. "
-                                "Format: {\"action\": \"click\"|\"type\"|\"done\", \"label\": \"visible_text\", \"text_to_type\": \"...\", \"reason\": \"...\"}"
-                            )
+                            "content": system_prompt
                         },
                         {
                             "role": "user",
@@ -221,12 +239,32 @@ async def run_agent(request: AgentRequest):
                 )
 
                 decision = json.loads(response.choices[0].message.content)
-                print(f"📍 Step {step} (Tab {len(all_pages)}): {decision['action']} -> {decision['reason']}")
+                
+                # Safely get action and reason
+                current_action = decision.get('action', 'unknown')
+                reason = decision.get('reason', 'No reason provided')
+                
+                print(f"📍 Step {step} (Tab {len(all_pages)}): {current_action} -> {reason}")
+                
+                # Track if same action repeating
+                if current_action == last_action:
+                    action_repeat_count += 1
+                else:
+                    action_repeat_count = 0
+                    last_action = current_action
+                
+                # If same action repeated 5+ times, force stop
+                if action_repeat_count >= 5:
+                    print(f"🛑 Same action '{current_action}' repeated {action_repeat_count} times. Giving up.")
+                    final_message = f"Failed: Stuck in loop - action '{current_action}' repeated {action_repeat_count} times"
+                    break
 
                 if decision['action'] == 'done':
-                    final_message = f"Success: {decision['reason']}"
+                    final_message = f"Success: {reason}"
                     final_status = "success"
                     break
+                
+                action_succeeded = False
                 
                 try:
                     if decision['action'] == 'click':
@@ -248,22 +286,37 @@ async def run_agent(request: AgentRequest):
                             await element.click(timeout=5000, force=True) 
                             
                             # Wait slightly longer after clicks to allow new tabs to spawn
-                            await asyncio.sleep(2) 
+                            await asyncio.sleep(2)
+                            action_succeeded = True
                         else:
-                             print(f"⚠️ Could not find element: {label}")
+                            print(f"⚠️ Could not find element: {label}")
 
                     elif decision['action'] == 'type':
                         search_box = page.locator("input[type='text'], input[type='search'], [aria-label='Search']").first
-                        await search_box.click()
+                        await search_box.click(timeout=5000)
                         await search_box.type(decision.get('text_to_type', ''), delay=100)
                         await page.keyboard.press("Enter")
                         if "google" in page.url:
                             await asyncio.sleep(1)
                             await page.keyboard.press("Enter")
                         await page.wait_for_timeout(4000)
+                        action_succeeded = True
                 
                 except Exception as ex:
-                    print(f"⚠️ Action retryable error: {ex}")
+                    print(f"⚠️ Action error: {ex}")
+                    action_succeeded = False
+                
+                # Track consecutive failures
+                if action_succeeded:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                
+                # If 8+ consecutive failures, stop
+                if consecutive_failures >= 8:
+                    print(f"🛑 {consecutive_failures} consecutive failures. Stopping.")
+                    final_message = f"Failed: Too many consecutive failures ({consecutive_failures})"
+                    break
             
             # --- ERROR ANALYSIS ---
             if final_status == "failed" and last_b64_image:
