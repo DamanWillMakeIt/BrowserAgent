@@ -132,15 +132,37 @@ async def run_agent(request: AgentRequest):
 
     try:
         async with async_playwright() as p:
+            
+            # ---------------------------------------------------------
+            # SMART LAUNCH CONFIGURATION
+            # ---------------------------------------------------------
+            # Check if running on Render (Production) or Local
+            is_production = os.getenv("RENDER") is not None
+            
+            # Launch Args
+            launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+            if not is_production:
+                launch_args.append("--start-maximized") # Only maximize window if we have a screen (Local)
+
             browser = await p.chromium.launch(
-                headless=False, # Set True for Render
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--start-maximized"]
+                headless=is_production, # True on Render, False on Local
+                args=launch_args
             ) 
             
-            context = await browser.new_context(
-                no_viewport=True, 
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            )
+            # Context Configuration
+            if is_production:
+                # On Server: Force 1080p resolution for clear video
+                context = await browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                )
+            else:
+                # On Local: Use full screen
+                context = await browser.new_context(
+                    no_viewport=True, 
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                )
+            # ---------------------------------------------------------
             
             # Start with one page
             page = await context.new_page()
